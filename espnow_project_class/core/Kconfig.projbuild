@@ -1,14 +1,50 @@
-# put here your custom config value
-menu "Example Configuration"
-config ESP_WIFI_SSID
-    string "WiFi SSID"
-    default "myssid"
-    help
-	SSID (network name) for the example to connect to.
+menu "ESP-NOW Node Configuration"
 
-config ESP_WIFI_PASSWORD
-    string "WiFi Password"
-    default "mypassword"
-    help
-	WiFi password (WPA or WPA2) for the example to use.
+    config ESPNOW_OTA_WIFI_SSID
+        string "OTA WiFi SSID"
+        default "MyWiFi"
+        help
+            SSID del punto de acceso WiFi usado durante la actualización OTA.
+            No se usa en modo normal (ESP-NOW no requiere conexión a AP).
+
+    config ESPNOW_OTA_WIFI_PASS
+        string "OTA WiFi Password"
+        default ""
+        help
+            Contraseña del AP para OTA. Dejar vacío si la red es abierta.
+
+    config ESPNOW_OTA_URL
+        string "OTA Firmware URL"
+        default "https://example.com/firmware.bin"
+        help
+            URL HTTPS del binario de firmware para actualización OTA.
+
+    config ESPNOW_NODE_PAN_ID
+        int "PAN ID"
+        default 1
+        range 1 15
+        help
+            Identificador de la red PAN a la que pertenece este nodo (1-15).
+
+    config ESPNOW_NODE_APP_ID
+        int "Application ID"
+        default 1
+        range 1 65535
+        help
+            Identificador de la aplicación dentro de la PAN.
+
+    config ESPNOW_SLEEP_SEC
+        int "Default deep sleep duration (seconds)"
+        default 30
+        range 5 3600
+        help
+            Tiempo de deep sleep por defecto. Puede ser sobreescrito via MQTT.
+
+    config ESPNOW_PAIRING_TIMEOUT_MS
+        int "Pairing timeout (ms)"
+        default 3000
+        range 1000 60000
+        help
+            Tiempo máximo para completar el emparejamiento antes de entrar en sleep.
+
 endmenu

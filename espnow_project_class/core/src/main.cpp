@@ -1,208 +1,243 @@
+/**
+ * @file main.cpp
+ * @brief Punto de entrada del firmware ESP-NOW sensor node.
+ *
+ * Arquitectura de tareas FreeRTOS:
+ *
+ *   Core 0:
+ *     pairing_task  (prio 5) – state machine de pairing
+ *     send_task     (prio 4) – procesa cola de envíos
+ *     recv_task     (prio 4) – procesa cola de recepciones
+ *
+ *   Core 1:
+ *     sensor_task   (prio 3) – lee ADC, construye JSON y llama a espnow_send()
+ *     ota_task      (prio 2) – solo se crea si hay actualización disponible
+ *
+ * Comunicación entre tareas exclusivamente mediante colas y semáforos FreeRTOS.
+ * No hay variables globales compartidas directamente entre tareas.
+ *
+ * Credenciales WiFi (OTA) y URL de firmware configuradas mediante menuconfig
+ * (Kconfig.projbuild).
+ */
+
 #include "AUTOpairing.h"
-#include "ADConeshot.h"
 #include "AnomalyDetection.h"
 #include "cJSON.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
-using namespace std;
+extern "C" { void app_main(void); }
 
-// https://github.com/topics/pearson-correlation-coefficient?l=c%2B%2B&o=asc&s=updated
-// https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/memory-types.html
-// https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/performance/size.html
-extern "C"
+static const char *TAG = "main";
+
+/* ── Credenciales desde menuconfig ─────────────────────────────────────── */
+#ifndef CONFIG_ESPNOW_OTA_WIFI_SSID
+#define CONFIG_ESPNOW_OTA_WIFI_SSID     "MyWiFi"
+#endif
+#ifndef CONFIG_ESPNOW_OTA_WIFI_PASS
+#define CONFIG_ESPNOW_OTA_WIFI_PASS     "MyPassword"
+#endif
+#ifndef CONFIG_ESPNOW_OTA_URL
+#define CONFIG_ESPNOW_OTA_URL           "https://example.com/firmware.bin"
+#endif
+
+/* ── Configuración de sensores ADC ──────────────────────────────────────── */
+static adc_channel_t s_adc_channels[] = {
+    ADC_CHANNEL_0,
+    ADC_CHANNEL_1,
+    ADC_CHANNEL_2,
+    ADC_CHANNEL_4,
+};
+static const uint8_t NUM_ADC_CHANNELS =
+    sizeof(s_adc_channels) / sizeof(adc_channel_t);
+
+/* ── Configuración del nodo ─────────────────────────────────────────────── */
+#define NODE_PAN_ID    4     /**< Identificador de red PAN */
+#define NODE_APP_ID    5     /**< Identificador de aplicación dentro de la PAN */
+#define ESPNOW_START_CHANNEL  1
+
+/* ── Datos en RTC RAM (sobreviven al deep sleep) ────────────────────────── */
+RTC_DATA_ATTR static uint16_t s_own_raw[ESPNOW_MAX_READINGS];
+RTC_DATA_ATTR static uint16_t s_peer_raw[ESPNOW_MAX_READINGS];
+RTC_DATA_ATTR static uint8_t  s_own_count  = 0;
+RTC_DATA_ATTR static uint8_t  s_peer_count = 0;
+
+/* ── Estado de actualización OTA ────────────────────────────────────────── */
+static volatile update_status_t s_update_status = UPDATE_NONE;
+
+/* ── NVS store (compartido entre módulos, acceso serializado por tareas) ─ */
+static nvs_store_t s_nvs_store;
+
+/* ── Semáforo de control de envío ───────────────────────────────────────── */
+static SemaphoreHandle_t s_send_ready = NULL;   /**< dado cuando pairing OK */
+static SemaphoreHandle_t s_send_sem   = NULL;   /**< control flujo de envío */
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Callbacks de usuario
+   ══════════════════════════════════════════════════════════════════════════ */
+
+static void on_mqtt_msg(espnow_rcv_msg_t *msg)
 {
-	void app_main(void);
+    if (!msg || !msg->topic || !msg->payload) return;
+
+    ESP_LOGI(TAG, "MQTT msg | topic: %s | payload: %s",
+             msg->topic, msg->payload);
+
+    cJSON *root = cJSON_Parse(msg->payload);
+    if (!root) {
+        ESP_LOGE(TAG, "JSON parse error");
+        goto cleanup;
+    }
+
+    if (strcmp(msg->topic, "config") == 0) {
+        /* Actualiza configuración dinámica */
+        cJSON *j_sleep   = cJSON_GetObjectItem(root, "sleep");
+        cJSON *j_timeout = cJSON_GetObjectItem(root, "timeout");
+
+        if (j_sleep)   espnow_sleep_set_duration(j_sleep->valueint);
+        if (j_timeout) { /* podría actualizar el timeout de pairing */ }
+
+        /* Persiste en NVS */
+        if (j_sleep)   s_nvs_store.config[2] = (uint16_t)j_sleep->valueint;
+        if (j_timeout) s_nvs_store.config[1] = (uint16_t)j_timeout->valueint;
+        s_nvs_store.code2 = MAGIC_CODE2;
+        espnow_nvs_save(&s_nvs_store);
+        ESP_LOGI(TAG, "Config updated");
+    }
+    else if (strcmp(msg->topic, "update") == 0) {
+        ESP_LOGI(TAG, "OTA update requested");
+        s_update_status = UPDATE_AVAILABLE;
+        /* La tarea OTA se crea dinámicamente */
+        xTaskCreatePinnedToCore(
+            espnow_ota_task, "ota_task",
+            8192, NULL, 2, NULL, 1);
+    }
+
+cleaning:
+    cJSON_Delete(root);
+cleanup:
+    free(msg->topic);
+    free(msg->payload);
+    free(msg);
 }
 
-#define LOG_LEVEL_LOCAL ESP_LOG_VERBOSE
-
-#define LOG_TAG "main"
-
-static AUTOpairing_t clienteAP;
-static ADConeshot_t ADConeshot;
-static AnomalyDetection_t AnomalyDetect;
-
-const char *ESP_WIFI_SSID = "IoTLab";
-const char *ESP_WIFI_PASS = "4cc3s0IoT@";
-const char *FIRMWARE_UPGRADE_URL = "https://huertociencias.uma.es/ESP32OTA/espnow_project.bin";
-
-UpdateStatus updateStatus = NO_UPDATE_FOUND;
-
-// int adc_channel[1] = {ADC_CHANNEL_0};
-static adc_channel_t adc_channel[4] = {ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_4};
-// static adc_channel_t adc_channel[1] = {ADC_CHANNEL_0};
-uint8_t lengthADC1_CHAN = sizeof(adc_channel) / sizeof(adc_channel_t);
-
-typedef struct
+static void on_pan_msg(espnow_rcv_msg_t *msg)
 {
-	uint8_t pan;
-	uint16_t timeout;
-	uint16_t tsleep;
-	uint16_t time;
-} struct_config;
-struct_config strConfig;
+    if (!msg || !msg->payload) return;
 
-// typedef struct
-// { // new structure for DATA SAVING
-// 	uint16_t own_raw_data;
-// 	uint16_t peer_raw_data;
-// } struct_readings;
+    ESP_LOGI(TAG, "PAN msg | age: %" PRIu32 " ms | MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             msg->ms_old,
+             msg->macAddr[0], msg->macAddr[1], msg->macAddr[2],
+             msg->macAddr[3], msg->macAddr[4], msg->macAddr[5]);
 
-// RTC_DATA_ATTR static struct_readings data_read[ESPNOW_MAXIMUM_READINGS]; // Datos propios
-// https://github.com/G6EJD/ESP32_RTC_RAM/blob/master/ESP32_BME280_RTCRAM_Datalogger.ino
-RTC_DATA_ATTR static uint16_t own_raw_data[ESPNOW_MAXIMUM_READINGS];  // Datos propios
-RTC_DATA_ATTR static uint16_t peer_raw_data[ESPNOW_MAXIMUM_READINGS]; // Datos peer
-RTC_DATA_ATTR uint8_t personal_data_count = 0;
-RTC_DATA_ATTR uint8_t incoming_data_count = 0;
+    cJSON *root = cJSON_Parse(msg->payload);
+    if (root) {
+        cJSON *sensor0 = cJSON_GetObjectItem(root, "Sensor0");
+        if (sensor0) {
+            cJSON *raw = cJSON_GetObjectItem(sensor0, "raw_voltage");
+            if (raw) {
+                s_peer_raw[s_peer_count % ESPNOW_MAX_READINGS] =
+                    (uint16_t)raw->valueint;
+                s_peer_count++;
+                ESP_LOGI(TAG, "Peer raw: %d", raw->valueint);
+            }
+        }
+        cJSON_Delete(root);
+    }
 
-// https://github.com/DaveGamble/cJSON#building
-
-void pan_process_msg(struct_espnow_rcv_msg *my_msg)
-{
-	ESP_LOGI("* PAN process", "Mensaje PAN recibido");
-	ESP_LOGI("* PAN process", "Antiguedad mensaje (ms): %lu", my_msg->ms_old);
-	ESP_LOGI("* PAN process", "MAC: %02X:%02X:%02X:%02X:%02X:%02X", my_msg->macAddr[0], my_msg->macAddr[1], my_msg->macAddr[2], my_msg->macAddr[3], my_msg->macAddr[4], my_msg->macAddr[5]);
-	ESP_LOGI("* PAN process", "Payload: %s", my_msg->payload);
-	ESP_LOGI("* PAN process", "My PAN: %d", clienteAP.get_pan());
-	ESP_LOGI("* PAN process", "Peer PAN: %d", clienteAP.get_pan());
-	// Parse the JSON data
-	cJSON *json = cJSON_Parse(my_msg->payload);
-	//  Check if parsing was successful
-	if (json == NULL)
-	{
-		const char *error_ptr = cJSON_GetErrorPtr();
-		if (error_ptr != NULL)
-		{
-			fprintf(stderr, "Error before: %s\n", error_ptr);
-		}
-		cJSON_Delete(json);
-		return;
-	}
-	cJSON *data = cJSON_GetObjectItem(json, "Sensor0");
-	if (data)
-	{
-		cJSON *volt_data = cJSON_GetObjectItem(data, "adc_voltage");
-		cJSON *raw_data = cJSON_GetObjectItem(data, "raw_voltage");
-		peer_raw_data[incoming_data_count] = raw_data->valueint;
-		ESP_LOGI("Peer_reading", "ADC_FILTERED = %d", volt_data->valueint);
-		ESP_LOGI("Peer_reading", "ADC_VOLTAGE = %d", raw_data->valueint);
-		ESP_LOGI(TAG, "peer_data_raw:%d", peer_raw_data[incoming_data_count]);
-		incoming_data_count++;
-		if (incoming_data_count >= ESPNOW_MAXIMUM_READINGS)
-		{
-			// We can do something interesting here
-			incoming_data_count = 0; // Reset counter
-		}
-	}
-	cJSON_Delete(json);
+    free(msg->payload);
+    free(msg);
 }
 
-void mqtt_process_msg(struct_espnow_rcv_msg *my_msg)
-{
-	ESP_LOGI("* mqtt process", "topic: %s", my_msg->topic);
-	cJSON *root = cJSON_Parse(my_msg->payload);
-	if (root == NULL)
-	{
-		const char *error_ptr = cJSON_GetErrorPtr();
-		if (error_ptr != NULL)
-		{
-			fprintf(stderr, "Error before: %s\n", error_ptr);
-		}
-		return;
-	}
-	if (strcmp(my_msg->topic, "config") == 0)
-	{
-		ESP_LOGI("* mqtt process", "payload: %s", my_msg->payload);
-		ESP_LOGI("* mqtt process", "Deserialize payload.....");
-		cJSON *sleep = cJSON_GetObjectItem(root, "sleep");
-		cJSON *timeout = cJSON_GetObjectItem(root, "timeout");
-		cJSON *pan = cJSON_GetObjectItem(root, "pan");
-		uint16_t config[MAX_CONFIG_SIZE]; // max config size
-		if (timeout)
-			config[1] = timeout->valueint;
-		if (sleep)
-			config[2] = sleep->valueint;
-		if (pan)
-			config[3] = pan->valueint;
-		clienteAP.set_config(config);
-	}
-	if (strcmp(my_msg->topic, "update") == 0)
-	{
-		updateStatus = THERE_IS_AN_UPDATE_AVAILABLE;
-		clienteAP.init_update(); // ¿Porque funciona en app_main y aqui no? :(
-
-		// Añadir en main si se quiere funcionalidad
-
-		// switch (updateStatus)
-		// {
-		// case THERE_IS_AN_UPDATE_AVAILABLE:
-		// 	clienteAP.init_update();
-		// 	break;
-		// case NO_UPDATE_FOUND:
-		// 	// get deep sleep enter time
-		// 	//						gotoSleep();
-		// 	break;
-		// }
-	}
-	free(my_msg->topic);
-	free(my_msg->payload);
-	cJSON_Delete(root);
-}
+/* ══════════════════════════════════════════════════════════════════════════
+   app_main
+   ══════════════════════════════════════════════════════════════════════════ */
 
 void app_main(void)
 {
-	clienteAP.init_config_size(sizeof(strConfig));
-	if (clienteAP.get_config((uint16_t *)&strConfig) == false)
-	{
-		strConfig.timeout = 3000;
-		strConfig.tsleep = 30;
-	}
+    ESP_LOGI(TAG, "=== ESP-NOW Sensor Node booting ===");
+    ESP_LOGI(TAG, "Deep sleep elapsed: %" PRId32 " ms",
+             espnow_sleep_elapsed_ms());
 
-	struct_adclist *my_reads = ADConeshot.set_adc_channel(adc_channel, lengthADC1_CHAN);
-	clienteAP.esp_set_https_update(FIRMWARE_UPGRADE_URL, ESP_WIFI_SSID, ESP_WIFI_PASS);
-	clienteAP.set_timeOut(strConfig.timeout, true); // tiempo máximo
-	clienteAP.set_deepSleep(strConfig.tsleep);		// tiempo dormido en segundos
-	ESP_LOGI("Config debug", "Timeout = %d", strConfig.timeout);
-	ESP_LOGI("Config debug", "Timesleep = %d", strConfig.tsleep);
-	clienteAP.set_channel(1);						   // canal donde empieza el scaneo
-	clienteAP.set_app_area(4, 5);					   // indico PAN y aplicación a la que pertenece
-	clienteAP.set_mqtt_msg_callback(mqtt_process_msg); // por defecto a NULL -> no se llama a ninguna función
-	clienteAP.set_pan_msg_callback(pan_process_msg);
-	clienteAP.begin();
+    /* 1. Cargar NVS ──────────────────────────────────────────────────────── */
+    espnow_nvs_load(&s_nvs_store);
 
-	if (clienteAP.envio_disponible() == true)
-	{
-		cJSON *root, *fmt;
-		const esp_partition_t *running = esp_ota_get_running_partition();
-		esp_app_desc_t running_app_info;
-		char tag[25];
-		// ADConeshot.adc_init(my_reads);
+    /* 2. Leer configuración guardada ────────────────────────────────────── */
+    uint32_t timeout_ms = 3000;
+    uint32_t sleep_sec  = 30;
+    if (s_nvs_store.code2 == MAGIC_CODE2) {
+        timeout_ms = s_nvs_store.config[1];
+        sleep_sec  = s_nvs_store.config[2];
+        ESP_LOGI(TAG, "Config from NVS: timeout=%" PRIu32 " ms, sleep=%" PRIu32 " s",
+                 timeout_ms, sleep_sec);
+    }
 
-		root = cJSON_CreateObject();
-		if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK)
-		{
-			cJSON_AddStringToObject(root, "fw_version", running_app_info.version);
-		}
+    /* 3. Configurar deep sleep ──────────────────────────────────────────── */
+    espnow_sleep_set_duration(sleep_sec);
 
-		for (int i = 0; i < my_reads->length; i++)
-		{
-			ESP_LOGI(TAG, "Serialize readings of channel %d", i);
-			sprintf(tag, "Sensor%d", i);
-			cJSON_AddItemToObject(root, tag, fmt = cJSON_CreateObject());
+    /* 4. Configurar OTA ─────────────────────────────────────────────────── */
+    espnow_ota_set_config(
+        CONFIG_ESPNOW_OTA_URL,
+        CONFIG_ESPNOW_OTA_WIFI_SSID,
+        CONFIG_ESPNOW_OTA_WIFI_PASS);
 
-			cJSON_AddNumberToObject(fmt, "adc_voltage", 1234);
-			//cJSON_AddNumberToObject(fmt, "raw_voltage", 1234);
-			//cJSON_AddNumberToObject(fmt, "dummy_val", 1234);
-		}
-		// Build topic from incoming message and public
-		char *send_topic = "unbuentopic/tienecache";
-		char *my_json_string = cJSON_PrintUnformatted(root);
-		size_t msg_size = strlen(my_json_string);
-		ESP_LOGI(TAG, "my_json_string\n%s", my_json_string);
-		ESP_LOGI("* Tamaño paquete", "El mensaje ocupa %i bytes", msg_size);
+    /* 5. Inicializar WiFi (modo ESP-NOW) ─────────────────────────────────── */
+    espnow_wifi_init();
 
-		clienteAP.espnow_send_check(send_topic, my_json_string); // hará deepsleep por defecto
-		free(my_reads);
-		cJSON_Delete(root);
-		cJSON_free(my_json_string);
-	}
+    /* 6. Crear semáforos ─────────────────────────────────────────────────── */
+    s_send_ready = xSemaphoreCreateBinary();   /* dado por pairing_task al emparejar */
+    s_send_sem   = xSemaphoreCreateBinary();   /* control de flujo de envío */
+    xSemaphoreGive(s_send_sem);                /* libre al arrancar */
+
+    /* 7. Inicializar módulo de comunicación ─────────────────────────────── */
+    espnow_comm_init(&s_nvs_store, s_send_sem,
+                     NODE_PAN_ID, on_mqtt_msg, on_pan_msg);
+
+    /* 8. Inicializar módulo de pairing ──────────────────────────────────── */
+    espnow_pairing_init(&s_nvs_store, s_send_ready,
+                        ESPNOW_START_CHANNEL, timeout_ms);
+
+    /* 9. Crear tareas FreeRTOS ──────────────────────────────────────────── */
+    ESP_LOGI(TAG, "Creating FreeRTOS tasks");
+
+    xTaskCreatePinnedToCore(
+        espnow_pairing_task, "pairing_task",
+        4096, NULL, 5, NULL, 0);
+
+    xTaskCreatePinnedToCore(
+        espnow_send_task, "send_task",
+        4096, NULL, 4, NULL, 0);
+
+    xTaskCreatePinnedToCore(
+        espnow_recv_task, "recv_task",
+        4096, NULL, 4, NULL, 0);
+
+    /* Parámetros de la tarea de sensor (estáticos: no se liberan) */
+    static sensor_task_params_t sensor_params = {
+        .channels      = s_adc_channels,
+        .num_channels  = NUM_ADC_CHANNELS,
+        .send_topic    = "sensors/node",
+        .request_check = true,
+    };
+
+    xTaskCreatePinnedToCore(
+        espnow_sensor_task, "sensor_task",
+        6144, &sensor_params, 3, NULL, 1);
+
+    /* 10. app_main termina: FreeRTOS scheduler gestiona todo ────────────── */
+    ESP_LOGI(TAG, "All tasks created – scheduler running");
+
+    /*
+     * Espera a que pairing_task libere s_send_ready.
+     * Si no se empareja en timeout_ms, también se libera para hacer deep sleep.
+     */
+    if (xSemaphoreTake(s_send_ready, portMAX_DELAY) == pdTRUE) {
+        if (!espnow_pairing_is_paired()) {
+            ESP_LOGW(TAG, "Pairing timed out – entering deep sleep");
+            espnow_sleep_enter(true);
+        }
+    }
+    /* Si llegamos aquí es que estamos emparejados y operando normalmente */
 }
